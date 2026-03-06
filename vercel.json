@@ -5,7 +5,7 @@
       "use": "@vercel/python"
     },
     {
-      "src": "streamlit_app.py",
+      "src": "frontend/streamlit_app.py",
       "use": "@vercel/static-build",
       "config": {
         "distDir": "."
@@ -19,7 +19,7 @@
     },
     {
       "src": "/(.*)",
-      "dest": "/streamlit_app.py"
+      "dest": "/frontend/streamlit_app.py"
     }
   ]
 }
