@@ -1,29 +1,41 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text  # 导入 text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from app.config import settings
-import os
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # 获取数据库连接字符串
 database_url = settings.database_url
+logger.info(f"Connecting to database: {database_url[:20]}...")
 
-# 如果是SQLite，改为PostgreSQL（Neon）
-if database_url.startswith('sqlite'):
-    # 生产环境使用环境变量中的DATABASE_URL
-    database_url = os.getenv('DATABASE_URL', database_url)
-    # Neon需要SSL
+try:
+    # 配置连接参数
+    connect_args = {}
     if 'neon.tech' in database_url:
-        connect_args = {"sslmode": "require"}
-    else:
-        connect_args = {}
-else:
-    connect_args = {"sslmode": "require"} if 'neon.tech' in database_url else {}
+        connect_args = {
+            "sslmode": "require",
+            "connect_timeout": 10
+        }
+    
+    # 创建引擎
+    engine = create_engine(
+        database_url,
+        connect_args=connect_args,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True
+    )
+    
+    # 测试连接 - 关键修改：使用 text()
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))  # 修改这一行
+        logger.info("✅ Database connected successfully!")
+        
+except Exception as e:
+    logger.error(f"❌ Database connection failed: {str(e)}")
+    engine = None
 
-engine = create_engine(
-    database_url,
-    connect_args=connect_args,
-    pool_size=5,
-    max_overflow=10
-)
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine) if engine else None
 Base = declarative_base()
