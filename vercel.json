@@ -10,10 +10,5 @@
       "src": "/api/(.*)",
       "dest": "app/main.py"
     }
-  ],
-  "functions": {
-    "app/**/*.py": {
-      "runtime": "python3.12"
-    }
-  }
+  ]
 }
