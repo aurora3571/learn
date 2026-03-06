@@ -1,7 +1,1 @@
-# 在 frontend 目录创建 runtime.txt
-echo "python-3.11" > frontend/runtime.txt
-
-# 确保 requirements.txt 只有前端依赖
-echo "streamlit==1.32.2" > frontend/requirements.txt
-echo "requests==2.31.0" >> frontend/requirements.txt
-echo "pandas==2.0.3" >> frontend/requirements.txt
+python-3.11
