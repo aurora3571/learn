@@ -1,7 +1,8 @@
 import streamlit as st
 import requests
+import os
 
-API_BASE = "http://127.0.0.1:8000/api"
+API_BASE = os.getenv("API_BASE", "/api")
 
 st.set_page_config(page_title="Agent Skills Hub", layout="wide")
 
