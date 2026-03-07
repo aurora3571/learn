@@ -1,14 +1,13 @@
 from app.services.github_fetcher import GithubFetcher
 from app.services.scorer import Scorer
 from app.models import Skill
+from app.config import settings
 from sqlalchemy.orm import Session
 import logging
 import time
 from datetime import datetime, timedelta
 from typing import Optional
 import threading
-import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,7 +19,7 @@ class SyncService:
     _is_syncing = False
     _sync_task: Optional[threading.Thread] = None
     MAX_ITEMS = 5000
-    BATCH_SIZE = 100
+    BATCH_SIZE = 50
 
     def __init__(self, db: Session):
         self.db = db
@@ -28,7 +27,7 @@ class SyncService:
         self.processed_repos = set()
 
     def sync_with_limit(self, is_auto_sync: bool = False):
-        """超快速同步方法"""
+        """同步方法"""
         try:
             with self.__class__._sync_lock:
                 if self.__class__._is_syncing:
@@ -40,63 +39,58 @@ class SyncService:
             sync_type = "AUTO" if is_auto_sync else "MANUAL"
             
             # 动态调整目标数量
-            target_items = min(1500 if is_auto_sync else self.MAX_ITEMS, self.MAX_ITEMS)
+            target_items = min(500 if is_auto_sync else self.MAX_ITEMS, self.MAX_ITEMS)
             
             logger.info(f"🚀 Starting {sync_type} sync (目标: {target_items} 条)")
 
+            # 检查 GitHub Token
+            logger.info(f"🔑 GitHub Token 是否存在: {bool(settings.github_token)}")
+            logger.info(f"📋 关键词数量: {len(self.fetcher.keywords)}")
+            if self.fetcher.keywords:
+                logger.info(f"🔑 前3个关键词: {self.fetcher.keywords[:3]}")
+
             # 重置请求计数
-            GithubFetcher.reset_request_count()
+            GithubFetcher.start_session()
             
             all_data = []
             page = 1
-            max_pages = 4 if is_auto_sync else 12
+            max_pages = 3 if is_auto_sync else 8
             consecutive_empty = 0
 
-            # 使用所有关键词，分批处理
             keywords = self.fetcher.keywords
-            keyword_batches = [keywords[i:i+5] for i in range(0, len(keywords), 5)]
 
-            # 快速抓取模式
+            # 顺序处理关键词
             while len(all_data) < target_items and page <= max_pages:
                 if GithubFetcher.should_stop():
                     logger.info(f"⛔ 达到请求上限，停止于 {len(all_data)} 条")
                     break
 
-                batch_repos = []
+                logger.info(f"📄 处理第 {page} 页...")
                 
-                # 并行搜索多个关键词批次
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    future_to_batch = {
-                        executor.submit(self.fetcher.search_batch, batch, page): batch
-                        for batch in keyword_batches[:3]  # 同时处理3个批次
-                    }
-                    
-                    for future in as_completed(future_to_batch):
-                        if GithubFetcher.should_stop():
-                            break
-                        try:
-                            repos = future.result(timeout=15)
-                            if repos:
-                                batch_repos.extend(repos)
-                        except Exception as e:
-                            logger.error(f"Batch search error: {e}")
+                page_repos = []
+                for keyword in keywords:
+                    if GithubFetcher.should_stop():
+                        break
+                    repos = self.fetcher.search(keyword, page, per_page=30)
+                    if repos:
+                        page_repos.extend(repos[:8])  # 每个关键词取8条
+                    time.sleep(0.2)
 
-                if batch_repos:
-                    # 快速去重
+                if page_repos:
+                    # 去重
                     unique_repos = {}
-                    for repo in batch_repos:
+                    for repo in page_repos:
                         repo_id = repo['id']
                         if repo_id not in unique_repos:
                             unique_repos[repo_id] = repo
                     
-                    repos_to_fetch = list(unique_repos.values())[:60]  # 最多取60条
+                    repos_to_fetch = list(unique_repos.values())[:20]  # 最多20条
                     
-                    logger.info(f"📦 批量获取 {len(repos_to_fetch)} 个仓库详情")
+                    logger.info(f"📦 获取 {len(repos_to_fetch)} 个仓库详情")
                     
-                    # 分批次获取详情
-                    details = self.fetcher.fetch_repo_details_batch(repos_to_fetch)
+                    # 顺序获取详情
+                    details = self.fetcher.fetch_repo_details_sequential(repos_to_fetch)
                     
-                    # 快速去重
                     for detail in details:
                         if detail and detail['name'] not in self.processed_repos:
                             all_data.append(detail)
@@ -104,10 +98,12 @@ class SyncService:
                     
                     consecutive_empty = 0
                     
-                    # 计算速度
+                    # 显示进度
                     elapsed = time.time() - start_time
-                    speed = len(all_data) / elapsed if elapsed > 0 else 0
-                    logger.info(f"📊 进度: {len(all_data)}/{target_items} 条 | 速度: {speed:.1f} 条/秒")
+                    stats = GithubFetcher.get_request_stats()
+                    logger.info(f"📊 进度: {len(all_data)}/{target_items} 条 | "
+                              f"请求: {stats['total_requests']}/5000 | "
+                              f"速度: {stats['speed']} 条/秒")
                 else:
                     consecutive_empty += 1
                     logger.info(f"⚠️ 第 {page} 页无数据")
@@ -115,7 +111,7 @@ class SyncService:
                 page += 1
                 
                 if consecutive_empty >= 2:
-                    logger.info("✅ 无更多数据可用")
+                    logger.info("✅ 无更多数据")
                     break
 
             logger.info(f"✅ 共获取 {len(all_data)} 条唯一数据")
@@ -129,19 +125,16 @@ class SyncService:
                     "elapsed_seconds": round(time.time() - start_time, 2)
                 }
 
-            # 快速处理数据
-            result = self._fast_process_data(all_data)
+            # 处理数据并保存
+            result = self._process_and_save_data(all_data)
             
-            stats = self.fetcher.get_request_stats()
+            stats = GithubFetcher.get_request_stats()
             result["api_stats"] = stats
 
             elapsed_time = time.time() - start_time
             result["elapsed_seconds"] = round(elapsed_time, 2)
             result["sync_type"] = sync_type
 
-            # 计算最终速度
-            avg_speed = len(all_data) / elapsed_time
-            logger.info(f"⚡ 平均速度: {avg_speed:.1f} 条/秒")
             logger.info(f"✅ 同步完成: +{result.get('inserted', 0)} 新, "
                        f"{result.get('updated', 0)} 更新, 耗时 {elapsed_time:.1f}秒")
 
@@ -157,27 +150,23 @@ class SyncService:
                 self.__class__._is_syncing = False
             self.processed_repos.clear()
 
-    def _fast_process_data(self, all_data):
-        """超快速处理数据"""
+    def _process_and_save_data(self, all_data):
+        """处理和保存数据"""
         try:
             logger.info(f"处理 {len(all_data)} 条数据...")
             
-            # 批量计算评分
+            # 计算评分
             scored_data = Scorer(all_data).calculate()
-            
             allowed_fields = Skill.__table__.columns.keys()
 
             updated_count = 0
             inserted_count = 0
-            batch_count = 0
 
-            # 超大批次处理
+            # 分批处理
             batch_size = self.BATCH_SIZE
             for i in range(0, len(scored_data), batch_size):
                 batch = scored_data[i:i + batch_size]
-                batch_count += 1
                 
-                # 批量处理
                 for item in batch:
                     try:
                         clean_item = {}
@@ -208,11 +197,10 @@ class SyncService:
                     except Exception as e:
                         logger.error(f"处理错误: {e}")
 
-                # 批量提交
+                # 提交批次
                 try:
                     self.db.commit()
-                    if batch_count % 2 == 0:
-                        logger.info(f"批次 {batch_count} 提交: +{inserted_count} 新, {updated_count} 更新")
+                    logger.info(f"批次提交: +{inserted_count} 新, {updated_count} 更新")
                 except Exception as e:
                     self.db.rollback()
                     logger.error(f"提交失败: {e}")
@@ -229,6 +217,7 @@ class SyncService:
 
     @classmethod
     def start_auto_sync(cls, db_factory):
+        """启动自动同步"""
         if cls._sync_task and cls._sync_task.is_alive():
             return
 

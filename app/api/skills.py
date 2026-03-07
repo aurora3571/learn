@@ -179,3 +179,34 @@ def debug_sync_info(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Debug error: {e}")
         return {"error": str(e)}
+
+@router.get("/debug/check-token")
+def check_token():
+    """检查 GitHub Token 是否有效"""
+    try:
+        from app.services.github_fetcher import GithubFetcher
+        fetcher = GithubFetcher()
+        
+        # 测试 rate_limit API
+        url = "https://api.github.com/rate_limit"
+        response = fetcher._request(url)
+        
+        if response:
+            data = response.json()
+            rate = data.get('rate', {})
+            return {
+                "token_valid": True,
+                "remaining_requests": rate.get('remaining', 0),
+                "reset_time": rate.get('reset', 0),
+                "token_preview": settings.github_token[:10] + "..." if settings.github_token else None
+            }
+        else:
+            return {
+                "token_valid": False,
+                "error": "Failed to get rate limit"
+            }
+    except Exception as e:
+        return {
+            "token_valid": False,
+            "error": str(e)
+        }
