@@ -5,6 +5,7 @@ from sqlalchemy import text
 import os
 from app.services.sync_service import SyncService
 import logging
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,7 +43,6 @@ def root():
 def health_check():
     """健康检查"""
     try:
-        from app.database import SessionLocal
         db = SessionLocal()
         db.execute(text("SELECT 1"))
         db.close()
@@ -61,19 +61,3 @@ def health_check():
         }
     except Exception as e:
         return {"status": "unhealthy", "database": str(e)}
-
-
-@app.get("/sync/status")
-def get_sync_status():
-    """获取同步状态"""
-    from datetime import datetime
-    time_since = None
-    if SyncService._last_sync_time:
-        time_since = (datetime.now() - SyncService._last_sync_time).total_seconds() / 60
-
-    return {
-        "is_syncing": SyncService._is_syncing,
-        "last_sync_time": SyncService._last_sync_time.isoformat() if SyncService._last_sync_time else None,
-        "max_items": SyncService.MAX_ITEMS,
-        "time_since_last_sync_minutes": round(time_since, 1) if time_since else None
-    }

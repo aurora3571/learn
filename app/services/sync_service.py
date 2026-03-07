@@ -19,8 +19,8 @@ class SyncService:
     _last_sync_time: Optional[datetime] = None
     _is_syncing = False
     _sync_task: Optional[threading.Thread] = None
-    MAX_ITEMS = 5000  # 从4500修改为5000
-    RATE_LIMIT_SLEEP = 30  # 减少限流等待时间
+    MAX_ITEMS = 5000  # 最大抓取数量
+    RATE_LIMIT_SLEEP = 30  # 限流等待时间
 
     def __init__(self, db: Session):
         self.db = db
@@ -66,7 +66,7 @@ class SyncService:
                     if len(all_data) >= target_items or GithubFetcher.should_stop():
                         break
                     
-                    repos = self.fetcher.search(keyword, page=page, per_page=50)  # 减少每页数量
+                    repos = self.fetcher.search(keyword, page=page, per_page=50)
                     if repos:
                         batch_repos.extend(repos[:20])  # 每个关键词最多取20个
 
@@ -125,7 +125,7 @@ class SyncService:
             logger.error(f"Error in sync: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            return {"error": str(e)}
+            return {"error": str(e), "message": "Sync failed"}
         finally:
             with self.__class__._sync_lock:
                 self.__class__._is_syncing = False
@@ -143,6 +143,7 @@ class SyncService:
 
             updated_count = 0
             inserted_count = 0
+            error_count = 0
 
             # 更大的批次处理
             batch_size = 100
@@ -162,6 +163,7 @@ class SyncService:
                                 clean_item[k] = v
 
                         if 'name' not in clean_item:
+                            error_count += 1
                             continue
 
                         existing = self.db.query(Skill).filter(
@@ -178,12 +180,13 @@ class SyncService:
 
                     except Exception as e:
                         logger.error(f"Error processing item: {e}")
+                        error_count += 1
                         continue
 
                 # 每批提交
                 try:
                     self.db.commit()
-                    logger.info(f"Batch {i//batch_size + 1} committed: +{inserted_count}/{updated_count}")
+                    logger.info(f"Batch {i//batch_size + 1} committed: +{inserted_count} new, {updated_count} updated")
                 except Exception as e:
                     self.db.rollback()
                     logger.error(f"Batch commit failed: {e}")
@@ -191,12 +194,13 @@ class SyncService:
             return {
                 "inserted": inserted_count,
                 "updated": updated_count,
+                "errors": error_count,
                 "total_fetched": len(all_data)
             }
 
         except Exception as e:
             logger.error(f"Error in processing: {e}")
-            return {"inserted": 0, "updated": 0, "total_fetched": len(all_data)}
+            return {"inserted": 0, "updated": 0, "total_fetched": len(all_data), "error": str(e)}
 
     @classmethod
     def start_auto_sync(cls, db_factory):

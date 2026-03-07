@@ -57,6 +57,7 @@ class GithubFetcher:
         with cls._request_lock:
             cls._total_requests = 0
             cls._stop_flag = False
+            logger.info("🔄 Request count reset to 0")
 
     @classmethod
     def should_stop(cls):
@@ -71,6 +72,7 @@ class GithubFetcher:
 
             if cls._total_requests >= cls._max_requests:
                 cls._stop_flag = True
+                logger.warning(f"⚠️ Request limit reached: {cls._total_requests}/{cls._max_requests}")
                 return False
 
             return True
@@ -107,10 +109,10 @@ class GithubFetcher:
             return None
 
         try:
-
             self._rate_limit_control()
+            current_count = self._increment_request_count()
 
-            self._increment_request_count()
+            logger.debug(f"Request #{current_count}: {url}")
 
             response = self.session.get(
                 url,
@@ -119,7 +121,6 @@ class GithubFetcher:
             )
 
             if response.status_code in (403, 429):
-
                 reset_time = int(
                     response.headers.get(
                         "X-RateLimit-Reset",
@@ -133,12 +134,12 @@ class GithubFetcher:
                 )
 
                 if sleep_time > 0:
+                    logger.warning(f"Rate limited, sleeping for {sleep_time}s")
                     time.sleep(sleep_time)
 
                 return self._request(url, params)
 
             response.raise_for_status()
-
             return response
 
         except Exception as e:
@@ -146,7 +147,6 @@ class GithubFetcher:
             return None
 
     def search(self, keyword: str, page: int = 1, per_page: int = 50):
-
         if self.should_stop():
             return []
 
@@ -169,37 +169,30 @@ class GithubFetcher:
         return []
 
     def fetch_repo_details_batch(self, repos):
-
         results = []
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-
             futures = [
                 executor.submit(self._fetch_single_repo, repo)
                 for repo in repos
             ]
 
             for future in as_completed(futures):
-
                 if self.should_stop():
                     break
 
                 result = future.result()
-
                 if result:
                     results.append(result)
 
         return results
 
     def _fetch_single_repo(self, repo):
-
         try:
-
             owner = repo["owner"]["login"]
             repo_name = repo["name"]
 
             repo_url = f"{self.BASE_URL}/repos/{owner}/{repo_name}"
-
             repo_response = self._request(repo_url)
 
             if not repo_response:
@@ -210,25 +203,19 @@ class GithubFetcher:
             last_commit = datetime.utcnow()
 
             try:
-
                 commits_url = f"{self.BASE_URL}/repos/{owner}/{repo_name}/commits"
-
                 commits_response = self._request(
                     commits_url,
                     params={"per_page": 1}
                 )
 
                 if commits_response:
-
                     commits_data = commits_response.json()
-
                     if commits_data:
-
                         last_commit = datetime.strptime(
                             commits_data[0]["commit"]["committer"]["date"],
                             "%Y-%m-%dT%H:%M:%SZ"
                         )
-
             except Exception:
                 pass
 
@@ -257,7 +244,6 @@ class GithubFetcher:
             return None
 
     def _simple_category(self, name: str, description: str):
-
         text = f"{name} {description}".lower()
 
         if any(k in text for k in ["agent", "llm", "ai"]):
@@ -273,11 +259,8 @@ class GithubFetcher:
 
     @classmethod
     def get_request_stats(cls):
-
         with cls._request_lock:
-
             percentage = 0
-
             if cls._max_requests > 0:
                 percentage = round(
                     (cls._total_requests / cls._max_requests) * 100,

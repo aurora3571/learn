@@ -34,28 +34,28 @@ def list_skills(
     category: str | None = Query(None),
     db: Session = Depends(get_db)
 ):
-
+    """获取技能列表，支持分页、排序和分类过滤"""
     try:
-
         query = db.query(Skill)
 
+        # 分类过滤
         if category:
             query = query.filter(Skill.category == category)
 
+        # 排序逻辑
         if sort == "score":
             query = query.order_by(Skill.score.desc())
-
         elif sort == "stars":
             query = query.order_by(Skill.stars.desc())
-
         elif sort == "forks":
             query = query.order_by(Skill.forks.desc())
-
         elif sort == "time":
             query = query.order_by(Skill.last_commit.desc())
 
+        # 统计总数
         total = query.count()
 
+        # 分页
         items = query.offset((page - 1) * size).limit(size).all()
 
         return {
@@ -69,11 +69,29 @@ def list_skills(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/sync/status")
+def get_sync_status():
+    """获取同步状态"""
+    try:
+        time_since = None
+        if SyncService._last_sync_time:
+            time_since = (datetime.now() - SyncService._last_sync_time).total_seconds() / 60
+
+        return {
+            "is_syncing": SyncService._is_syncing,
+            "last_sync_time": SyncService._last_sync_time.isoformat() if SyncService._last_sync_time else None,
+            "max_items": SyncService.MAX_ITEMS,
+            "time_since_last_sync_minutes": round(time_since, 1) if time_since else None
+        }
+    except Exception as e:
+        logger.error(f"Error getting sync status: {e}")
+        return {"error": str(e)}
+
+
 @router.get("/sync/progress")
 def get_sync_progress():
-
+    """获取同步进度"""
     try:
-
         stats = GithubFetcher.get_request_stats()
 
         return {
@@ -84,17 +102,46 @@ def get_sync_progress():
         }
 
     except Exception as e:
-
         logger.error(f"Error getting sync progress: {e}")
-
         return {"error": str(e)}
+
+
+@router.post("/sync")
+def sync_data(db: Session = Depends(get_db)):
+    """手动触发同步"""
+    try:
+        logger.info("=" * 50)
+        logger.info("MANUAL SYNC REQUESTED")
+        logger.info("=" * 50)
+
+        # 检查是否正在同步
+        if SyncService._is_syncing:
+            logger.warning("Manual sync blocked - sync already in progress")
+            return {
+                "message": "Sync already in progress",
+                "status": "busy"
+            }
+
+        # 执行同步
+        sync_service = SyncService(db)
+        result = sync_service.sync_with_limit(is_auto_sync=False)
+
+        logger.info("=" * 50)
+        logger.info(f"MANUAL SYNC COMPLETED: {result}")
+        logger.info("=" * 50)
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in sync_data: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {"error": str(e), "message": "Sync failed"}
 
 
 @router.get("/debug/sync-info")
 def debug_sync_info(db: Session = Depends(get_db)):
-
+    """调试信息：查看数据库状态"""
     try:
-
         total_skills = db.query(Skill).count()
 
         latest_skills = db.query(Skill).order_by(
@@ -130,7 +177,5 @@ def debug_sync_info(db: Session = Depends(get_db)):
         }
 
     except Exception as e:
-
         logger.error(f"Debug error: {e}")
-
         return {"error": str(e)}
