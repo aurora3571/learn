@@ -15,6 +15,7 @@ app = FastAPI(title="Agent Skills Platform")
 # 包含路由 - 所有API路径都会加上/api前缀
 app.include_router(router, prefix="/api")
 
+
 @app.on_event("startup")
 def startup_event():
     """应用启动时创建数据库表并启动自动同步"""
@@ -31,14 +32,17 @@ def startup_event():
         except Exception as e:
             logger.error(f"Failed to start auto sync service: {e}")
 
+
 @app.get("/")
 def root():
     return {"message": "Agent Skills API Running"}
+
 
 @app.get("/health")
 def health_check():
     """健康检查"""
     try:
+        from app.database import SessionLocal
         db = SessionLocal()
         db.execute(text("SELECT 1"))
         db.close()
@@ -52,16 +56,24 @@ def health_check():
         return {
             "status": "healthy",
             "database": "connected",
-            "sync": sync_status
+            "sync": sync_status,
+            "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
         return {"status": "unhealthy", "database": str(e)}
 
+
 @app.get("/sync/status")
 def get_sync_status():
     """获取同步状态"""
+    from datetime import datetime
+    time_since = None
+    if SyncService._last_sync_time:
+        time_since = (datetime.now() - SyncService._last_sync_time).total_seconds() / 60
+
     return {
         "is_syncing": SyncService._is_syncing,
         "last_sync_time": SyncService._last_sync_time.isoformat() if SyncService._last_sync_time else None,
-        "max_items": SyncService.MAX_ITEMS
+        "max_items": SyncService.MAX_ITEMS,
+        "time_since_last_sync_minutes": round(time_since, 1) if time_since else None
     }
