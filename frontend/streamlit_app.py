@@ -48,16 +48,41 @@ with st.sidebar:
             status_data = status_response.json()
             is_syncing = status_data.get('is_syncing', False)
             last_sync = status_data.get('last_sync_time', '未知')
+            max_items = status_data.get('max_items', 5000)
             
             if is_syncing:
                 st.warning("🟡 同步中...")
+                # 获取同步进度
+                try:
+                    progress_response = requests.get(f"{VERCEL_API_URL}/sync/progress", timeout=5)
+                    if progress_response.status_code == 200:
+                        progress_data = progress_response.json()
+                        progress = progress_data.get('progress', {})
+                        if progress:
+                            percentage = progress.get('percentage', 0)
+                            total = progress.get('total_requests', 0)
+                            max_req = progress.get('max_requests', 5000)
+                            st.progress(percentage / 100)
+                            st.caption(f"📊 API请求: {total}/{max_req} ({percentage}%)")
+                except:
+                    pass
             else:
                 st.success("🟢 空闲")
             
             if last_sync and last_sync != '未知':
-                st.info(f"上次同步: {last_sync[:10]} {last_sync[11:16]}")
-    except:
-        st.warning("⚪ 状态未知")
+                # 格式化时间显示
+                try:
+                    if 'T' in last_sync:
+                        sync_time = datetime.strptime(last_sync[:19], "%Y-%m-%dT%H:%M:%S")
+                        st.info(f"📅 上次同步: {sync_time.strftime('%Y-%m-%d %H:%M')}")
+                    else:
+                        st.info(f"📅 上次同步: {last_sync}")
+                except:
+                    st.info(f"📅 上次同步: {last_sync[:10]} {last_sync[11:16] if len(last_sync) > 10 else ''}")
+        else:
+            st.warning("⚪ 无法获取状态")
+    except Exception as e:
+        st.warning(f"⚪ 状态未知")
     
     st.divider()
     
@@ -72,6 +97,7 @@ with st.sidebar:
                         st.warning("⏳ 同步正在进行中")
                     else:
                         st.success("✅ 同步任务已启动！")
+                        st.info(f"⏱️ 目标数量: {result.get('total_fetched', 'N/A')} 条")
                         st.session_state.last_refresh = time.strftime("%Y-%m-%d %H:%M:%S")
                         time.sleep(2)
                         st.rerun()
@@ -130,7 +156,8 @@ with st.sidebar:
     - 数据来源：GitHub
     - 自动同步：每小时
     - 评分算法：综合多项指标
-    - 最大数量：4500条
+    - 最大数量：5000条
+    - 请求限制：达到5000次自动停止
     """)
 
 # 主内容区域
@@ -200,9 +227,10 @@ try:
                 3. 刷新页面查看数据
                 
                 **数据说明：**
-                - 每次同步最多获取4500条数据
+                - 每次同步最多获取5000条数据
                 - 自动同步每小时执行一次
                 - 评分基于多项指标计算
+                - API请求达到5000次自动停止
                 """)
         else:
             # 以卡片形式展示，使用Streamlit原生组件
@@ -221,11 +249,14 @@ try:
                     
                     # 描述
                     description = skill.get('description', '暂无描述')
-                    st.write(description[:200] + ('...' if len(description) > 200 else ''))
+                    if description:
+                        st.write(description[:200] + ('...' if len(description) > 200 else ''))
+                    else:
+                        st.write("*暂无描述*")
                     
                     # GitHub链接
                     url = skill.get('url', '#')
-                    if url != '#':
+                    if url and url != '#':
                         st.markdown(f"🔗 [GitHub仓库]({url})")
                     
                     # 作者信息
@@ -260,7 +291,14 @@ try:
                     last_commit = skill.get('last_commit', '')
                     if last_commit:
                         if isinstance(last_commit, str):
-                            last_commit_str = last_commit[:10]
+                            try:
+                                if 'T' in last_commit:
+                                    commit_date = datetime.strptime(last_commit[:19], "%Y-%m-%dT%H:%M:%S")
+                                    last_commit_str = commit_date.strftime("%Y-%m-%d %H:%M")
+                                else:
+                                    last_commit_str = last_commit[:10]
+                            except:
+                                last_commit_str = last_commit[:10]
                         else:
                             last_commit_str = str(last_commit)[:10]
                         st.caption(f"🕐 最后提交: {last_commit_str}")
@@ -306,7 +344,7 @@ with col1:
 with col2:
     st.caption(f"🕐 {time.strftime('%Y-%m-%d %H:%M:%S')}")
 with col3:
-    st.caption("📊 数据来源: GitHub API")
+    st.caption("📊 数据来源: GitHub API | 最大请求: 5000次")
 
 # 调试信息（仅在本地开发时显示）
 if os.getenv('STREAMLIT_DEBUG'):

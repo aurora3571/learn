@@ -288,3 +288,19 @@ def test_sync():
             "error": str(e),
             "traceback": traceback.format_exc()
         }
+        
+@router.get("/sync/progress")
+def get_sync_progress():
+    """获取同步进度"""
+    try:
+        from app.services.github_fetcher import GithubFetcher
+        stats = GithubFetcher.get_request_stats()
+        
+        return {
+            "is_syncing": SyncService._is_syncing,
+            "progress": stats,
+            "last_sync": SyncService._last_sync_time.isoformat() if SyncService._last_sync_time else None
+        }
+    except Exception as e:
+        logger.error(f"Error getting sync progress: {e}")
+        return {"error": str(e)}
