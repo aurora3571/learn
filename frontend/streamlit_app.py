@@ -31,6 +31,9 @@ st.markdown("""
         color: white;
         position: relative;
         overflow: hidden;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
     }
     
     .skill-card:hover {
@@ -65,6 +68,7 @@ st.markdown("""
         margin: 0;
         color: white;
         text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        word-break: break-word;
     }
     
     .card-category {
@@ -75,6 +79,7 @@ st.markdown("""
         font-weight: 500;
         backdrop-filter: blur(5px);
         border: 1px solid rgba(255,255,255,0.3);
+        white-space: nowrap;
     }
     
     /* 评分徽章 */
@@ -88,6 +93,7 @@ st.markdown("""
         color: #FFD700;
         text-align: center;
         backdrop-filter: blur(5px);
+        min-width: 100px;
     }
     
     .score-label {
@@ -106,10 +112,11 @@ st.markdown("""
         background: rgba(0,0,0,0.15);
         border-radius: 15px;
         padding: 15px;
-        margin: 15px 0;
+        margin: 0;
         font-size: 0.95rem;
         line-height: 1.5;
         border-left: 4px solid rgba(255,255,255,0.5);
+        word-break: break-word;
     }
     
     /* 指标网格 */
@@ -164,6 +171,7 @@ st.markdown("""
         display: flex;
         align-items: center;
         gap: 5px;
+        flex-wrap: wrap;
     }
     
     .github-link {
@@ -187,6 +195,8 @@ st.markdown("""
     .last-commit {
         opacity: 0.8;
         font-size: 0.85rem;
+        margin-top: 10px;
+        text-align: right;
     }
     
     /* 空状态 */
@@ -484,7 +494,20 @@ try:
                         else:
                             last_commit_str = "未知"
                         
-                        # 构建卡片HTML
+                        # 格式化数字（添加千位分隔符）
+                        stars = f"{skill.get('stars', 0):,}"
+                        forks = f"{skill.get('forks', 0):,}"
+                        open_issues = f"{skill.get('open_issues', 0):,}"
+                        closed_issues = f"{skill.get('closed_issues', 0):,}"
+                        total_commits = f"{skill.get('total_commits', 0):,}"
+                        author_followers = f"{skill.get('author_followers', 0):,}"
+                        
+                        # 获取描述（截断）
+                        description = skill.get('description', 'No description')
+                        if description and len(description) > 150:
+                            description = description[:150] + "..."
+                        
+                        # 构建卡片HTML - 确保所有标签正确闭合
                         card_html = f"""
                         <div class="skill-card">
                             <div class="card-header">
@@ -492,13 +515,13 @@ try:
                                 <span class="card-category">{skill.get('category', 'N/A')}</span>
                             </div>
                             
-                            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 15px;">
                                 <div style="flex: 1;">
                                     <div class="card-description">
-                                        {skill.get('description', 'No description')[:150]}{'...' if len(skill.get('description', '')) > 150 else ''}
+                                        {description}
                                     </div>
                                 </div>
-                                <div class="score-badge" style="margin-left: 20px;">
+                                <div class="score-badge">
                                     <span class="score-label">综合评分</span>
                                     <span class="score-value">{skill.get('score', 0):.1f}</span>
                                 </div>
@@ -508,34 +531,34 @@ try:
                                 <div class="metric-item">
                                     <div class="metric-icon">⭐</div>
                                     <div class="metric-label">Stars</div>
-                                    <div class="metric-value">{skill.get('stars', 0):,}</div>
+                                    <div class="metric-value">{stars}</div>
                                 </div>
                                 <div class="metric-item">
                                     <div class="metric-icon">🍴</div>
                                     <div class="metric-label">Forks</div>
-                                    <div class="metric-value">{skill.get('forks', 0):,}</div>
+                                    <div class="metric-value">{forks}</div>
                                 </div>
                                 <div class="metric-item">
                                     <div class="metric-icon">🐞</div>
                                     <div class="metric-label">Open Issues</div>
-                                    <div class="metric-value">{skill.get('open_issues', 0):,}</div>
+                                    <div class="metric-value">{open_issues}</div>
                                 </div>
                                 <div class="metric-item">
                                     <div class="metric-icon">✅</div>
                                     <div class="metric-label">Closed</div>
-                                    <div class="metric-value">{skill.get('closed_issues', 0):,}</div>
+                                    <div class="metric-value">{closed_issues}</div>
                                 </div>
                                 <div class="metric-item">
                                     <div class="metric-icon">📝</div>
                                     <div class="metric-label">Commits</div>
-                                    <div class="metric-value">{skill.get('total_commits', 0):,}</div>
+                                    <div class="metric-value">{total_commits}</div>
                                 </div>
                             </div>
                             
                             <div class="card-footer">
                                 <div class="author-info">
                                     <span>👤 {skill.get('author', 'Unknown')}</span>
-                                    <span style="opacity: 0.8;">({skill.get('author_followers', 0)} followers)</span>
+                                    <span style="opacity: 0.8;">({author_followers} followers)</span>
                                 </div>
                                 <div>
                                     <a href="{skill.get('url', '#')}" target="_blank" class="github-link">
