@@ -76,43 +76,38 @@ def by_category(category: str, db: Session = Depends(get_db)):
 
 @router.post("/sync")
 def sync_data(db: Session = Depends(get_db)):
-    """同步 GitHub 数据"""
+    """同步 GitHub 数据（手动触发）"""
     try:
-        logger.info("Starting sync process...")
-        
+        logger.info("Starting manual sync process...")
+
         # 记录开始时间
         import time
         start_time = time.time()
-        
+
         # 执行同步
         sync_service = SyncService(db)
-        logger.info(f"SyncService instance created: {sync_service}")
-        
-        # 检查是否有 sync 方法
-        if not hasattr(sync_service, 'sync'):
-            error_msg = "SyncService has no 'sync' method"
-            logger.error(error_msg)
-            return {"error": error_msg}
-        
+        logger.info(f"SyncService instance created")
+
         # 执行同步
-        result = sync_service.sync()
+        result = sync_service.sync_with_limit()
         logger.info(f"Sync completed, result: {result}")
-        
-        # 计算耗时
-        elapsed_time = time.time() - start_time
-        
-        return {
-            "message": "Sync completed",
-            "elapsed_seconds": round(elapsed_time, 2)
-        }
-    except AttributeError as e:
-        logger.error(f"AttributeError in sync_data: {str(e)}")
-        logger.error(traceback.format_exc())
-        return {"error": f"Method not found: {str(e)}"}
+
+        return result
+
     except Exception as e:
         logger.error(f"Error in sync_data: {str(e)}")
         logger.error(traceback.format_exc())
         return {"error": str(e)}
+
+
+@router.get("/sync/status")
+def get_sync_status():
+    """获取当前同步状态"""
+    return {
+        "is_syncing": SyncService._is_syncing,
+        "last_sync_time": SyncService._last_sync_time.isoformat() if SyncService._last_sync_time else None,
+        "max_items": SyncService.MAX_ITEMS
+    }
 
 
 @router.get("/test-sync")
@@ -121,19 +116,20 @@ def test_sync():
     try:
         from app.services.sync_service import SyncService
         from app.database import SessionLocal
-        
+
         db = SessionLocal()
         try:
             # 创建实例但不执行同步
             service = SyncService(db)
-            
+
             # 检查方法
             methods = [method for method in dir(service) if not method.startswith('_')]
-            
+
             return {
                 "status": "success",
                 "service_loaded": True,
                 "has_sync_method": hasattr(service, "sync"),
+                "has_sync_with_limit": hasattr(service, "sync_with_limit"),
                 "available_methods": methods,
                 "service_class": str(service.__class__),
                 "module": service.__class__.__module__
