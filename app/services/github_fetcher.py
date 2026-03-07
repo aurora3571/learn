@@ -7,6 +7,7 @@ from app.config import settings
 import logging
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +29,23 @@ class GithubFetcher:
 
         self.max_workers = max_workers or settings.github_max_workers
 
+        # 创建会话并配置连接池
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        
+        # 增加连接池大小
+        adapter = HTTPAdapter(
+            pool_connections=100,  # 连接池大小
+            pool_maxsize=100,      # 最大连接数
+            max_retries=3,
+            pool_block=False
+        )
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
 
         self.instance_requests = 0
         self.request_times = []
+        self.semaphore = threading.Semaphore(20)  # 控制并发数
 
         self.keywords = [
             "claude-mcp",
@@ -90,13 +103,10 @@ class GithubFetcher:
 
     def _rate_limit_control(self):
         now = time.time()
+        self.request_times = [t for t in self.request_times if now - t < 60]
 
-        self.request_times = [
-            t for t in self.request_times if now - t < 60
-        ]
-
-        if len(self.request_times) > 50:
-            sleep_time = random.uniform(0.5, 1.0)
+        if len(self.request_times) > 30:  # 降低阈值
+            sleep_time = random.uniform(0.2, 0.5)
             time.sleep(sleep_time)
 
         self.request_times.append(now)
@@ -108,45 +118,47 @@ class GithubFetcher:
         if not self.can_make_request():
             return None
 
-        try:
-            self._rate_limit_control()
-            current_count = self._increment_request_count()
+        # 使用信号量控制并发
+        with self.semaphore:
+            try:
+                self._rate_limit_control()
+                current_count = self._increment_request_count()
 
-            logger.debug(f"Request #{current_count}: {url}")
+                logger.debug(f"Request #{current_count}: {url}")
 
-            response = self.session.get(
-                url,
-                params=params,
-                timeout=settings.request_timeout
-            )
+                response = self.session.get(
+                    url,
+                    params=params,
+                    timeout=settings.request_timeout
+                )
 
-            if response.status_code in (403, 429):
-                reset_time = int(
-                    response.headers.get(
-                        "X-RateLimit-Reset",
-                        time.time() + 60
+                if response.status_code in (403, 429):
+                    reset_time = int(
+                        response.headers.get(
+                            "X-RateLimit-Reset",
+                            time.time() + 60
+                        )
                     )
-                )
 
-                sleep_time = min(
-                    reset_time - int(time.time()),
-                    60
-                )
+                    sleep_time = min(
+                        reset_time - int(time.time()),
+                        30  # 最多等待30秒
+                    )
 
-                if sleep_time > 0:
-                    logger.warning(f"Rate limited, sleeping for {sleep_time}s")
-                    time.sleep(sleep_time)
+                    if sleep_time > 0:
+                        logger.warning(f"Rate limited, sleeping for {sleep_time}s")
+                        time.sleep(sleep_time)
 
-                return self._request(url, params)
+                    return self._request(url, params)
 
-            response.raise_for_status()
-            return response
+                response.raise_for_status()
+                return response
 
-        except Exception as e:
-            logger.error(f"Request error: {e}")
-            return None
+            except Exception as e:
+                logger.error(f"Request error: {e}")
+                return None
 
-    def search(self, keyword: str, page: int = 1, per_page: int = 50):
+    def search(self, keyword: str, page: int = 1, per_page: int = 30):  # 减少每页数量
         if self.should_stop():
             return []
 
@@ -170,20 +182,32 @@ class GithubFetcher:
 
     def fetch_repo_details_batch(self, repos):
         results = []
+        
+        # 限制批处理大小
+        batch_size = 10
+        for i in range(0, len(repos), batch_size):
+            if self.should_stop():
+                break
+                
+            batch = repos[i:i + batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1}/{(len(repos)+batch_size-1)//batch_size}")
+            
+            with ThreadPoolExecutor(max_workers=min(5, self.max_workers)) as executor:
+                futures = [
+                    executor.submit(self._fetch_single_repo, repo)
+                    for repo in batch
+                ]
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [
-                executor.submit(self._fetch_single_repo, repo)
-                for repo in repos
-            ]
+                for future in as_completed(futures):
+                    if self.should_stop():
+                        break
 
-            for future in as_completed(futures):
-                if self.should_stop():
-                    break
-
-                result = future.result()
-                if result:
-                    results.append(result)
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                        
+            # 批次间延迟
+            time.sleep(0.5)
 
         return results
 

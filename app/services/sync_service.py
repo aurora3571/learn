@@ -14,13 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class SyncService:
-    # 类变量用于跟踪全局同步状态
     _sync_lock = threading.RLock()
     _last_sync_time: Optional[datetime] = None
     _is_syncing = False
     _sync_task: Optional[threading.Thread] = None
-    MAX_ITEMS = 5000  # 最大抓取数量
-    RATE_LIMIT_SLEEP = 30  # 限流等待时间
+    MAX_ITEMS = 5000
+    RATE_LIMIT_SLEEP = 30
 
     def __init__(self, db: Session):
         self.db = db
@@ -32,13 +31,14 @@ class SyncService:
         try:
             with self.__class__._sync_lock:
                 if self.__class__._is_syncing:
+                    logger.warning("Sync already in progress")
                     return {"message": "Sync already in progress", "status": "busy"}
                 self.__class__._is_syncing = True
                 self.__class__._last_sync_time = datetime.now()
 
             start_time = time.time()
             sync_type = "AUTO" if is_auto_sync else "MANUAL"
-            target_items = min(1000 if is_auto_sync else self.MAX_ITEMS, self.MAX_ITEMS)
+            target_items = min(500 if is_auto_sync else self.MAX_ITEMS, self.MAX_ITEMS)  # 降低自动同步目标
             
             logger.info(f"🚀 Starting {sync_type} sync (max: {target_items} items)")
 
@@ -47,13 +47,12 @@ class SyncService:
             
             all_data = []
             page = 1
-            max_pages = 5 if is_auto_sync else 20
+            max_pages = 3 if is_auto_sync else 10  # 减少页数
             consecutive_empty = 0
 
-            keywords = self.fetcher.keywords
+            keywords = self.fetcher.keywords[:5]  # 只使用前5个关键词
             random.shuffle(keywords)
 
-            # 快速抓取模式
             while len(all_data) < target_items and page <= max_pages:
                 if GithubFetcher.should_stop():
                     logger.info(f"⛔ Stop signal received at {len(all_data)} items")
@@ -61,38 +60,39 @@ class SyncService:
 
                 batch_repos = []
                 
-                # 批量获取搜索结果
-                for keyword in keywords[:10]:  # 限制关键词数量
+                for keyword in keywords:
                     if len(all_data) >= target_items or GithubFetcher.should_stop():
                         break
                     
-                    repos = self.fetcher.search(keyword, page=page, per_page=50)
+                    logger.info(f"Searching keyword: {keyword} (page {page})")
+                    repos = self.fetcher.search(keyword, page=page, per_page=30)
+                    
                     if repos:
-                        batch_repos.extend(repos[:20])  # 每个关键词最多取20个
+                        logger.info(f"Found {len(repos)} repos for {keyword}")
+                        batch_repos.extend(repos[:10])  # 每个关键词最多取10个
 
                 if batch_repos:
-                    # 批量获取详情
-                    logger.info(f"📦 Fetching details for {len(batch_repos)} repos (batch)")
+                    logger.info(f"📦 Fetching details for {len(batch_repos)} repos")
                     details = self.fetcher.fetch_repo_details_batch(batch_repos)
                     
                     for detail in details:
                         if detail and detail['name'] not in self.processed_repos:
                             all_data.append(detail)
                             self.processed_repos.add(detail['name'])
-                            
-                            if len(all_data) % 50 == 0:
-                                progress = (len(all_data) / target_items) * 100
-                                logger.info(f"📊 Progress: {len(all_data)}/{target_items} ({progress:.1f}%)")
                     
                     consecutive_empty = 0
+                    logger.info(f"Progress: {len(all_data)}/{target_items} items")
                 else:
                     consecutive_empty += 1
+                    logger.info(f"No data for page {page}")
 
                 page += 1
                 
                 if consecutive_empty >= 2:
                     logger.info("No more data available")
                     break
+                
+                time.sleep(1)  # 页面间延迟
 
             logger.info(f"✅ Fetched {len(all_data)} unique items")
 
@@ -108,7 +108,6 @@ class SyncService:
             # 计算评分并保存
             result = self._process_and_save_data(all_data)
             
-            # 获取请求统计
             stats = self.fetcher.get_request_stats()
             result["api_stats"] = stats
 
@@ -132,21 +131,19 @@ class SyncService:
             self.processed_repos.clear()
 
     def _process_and_save_data(self, all_data):
-        """快速处理和保存数据"""
+        """处理和保存数据"""
         try:
             logger.info(f"Processing {len(all_data)} items...")
             
-            # 批量计算评分
             scored_data = Scorer(all_data).calculate()
-            
             allowed_fields = Skill.__table__.columns.keys()
 
             updated_count = 0
             inserted_count = 0
             error_count = 0
 
-            # 更大的批次处理
-            batch_size = 100
+            # 使用更小的批次
+            batch_size = 20
             for i in range(0, len(scored_data), batch_size):
                 batch = scored_data[i:i + batch_size]
                 
@@ -181,12 +178,10 @@ class SyncService:
                     except Exception as e:
                         logger.error(f"Error processing item: {e}")
                         error_count += 1
-                        continue
 
-                # 每批提交
                 try:
                     self.db.commit()
-                    logger.info(f"Batch {i//batch_size + 1} committed: +{inserted_count} new, {updated_count} updated")
+                    logger.info(f"Batch committed: +{inserted_count} new, {updated_count} updated")
                 except Exception as e:
                     self.db.rollback()
                     logger.error(f"Batch commit failed: {e}")
@@ -204,11 +199,11 @@ class SyncService:
 
     @classmethod
     def start_auto_sync(cls, db_factory):
-        """启动自动同步"""
         if cls._sync_task and cls._sync_task.is_alive():
             return
 
         def sync_worker():
+            consecutive_failures = 0
             while True:
                 try:
                     now = datetime.now()
@@ -219,7 +214,7 @@ class SyncService:
                             should_sync = True
                         else:
                             time_diff = now - cls._last_sync_time
-                            if time_diff >= timedelta(hours=1):
+                            if time_diff >= timedelta(hours=2):  # 改为2小时
                                 should_sync = True
 
                     if should_sync and not cls._is_syncing:
@@ -227,11 +222,20 @@ class SyncService:
                         db = db_factory()
                         try:
                             service = cls(db)
-                            service.sync_with_limit(is_auto_sync=True)
+                            result = service.sync_with_limit(is_auto_sync=True)
+                            if result.get('inserted', 0) > 0:
+                                consecutive_failures = 0
+                            else:
+                                consecutive_failures += 1
+                        except Exception as e:
+                            logger.error(f"Auto sync failed: {e}")
+                            consecutive_failures += 1
                         finally:
                             db.close()
 
-                    time.sleep(60)
+                    # 动态调整检查间隔
+                    sleep_time = 300 if consecutive_failures > 3 else 120
+                    time.sleep(sleep_time)
 
                 except Exception as e:
                     logger.error(f"Auto sync error: {e}")
