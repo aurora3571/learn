@@ -1,0 +1,15 @@
+# 忽略不必要的文件
+__pycache__
+*.pyc
+.git
+.env
+.venv
+venv
+ENV
+env
+.DS_Store
+README.md
+.gitignore
+*.log
+streamlit_app.py
+init_db.py
