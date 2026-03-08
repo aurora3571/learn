@@ -3,6 +3,7 @@ import requests
 import os
 import time
 from datetime import datetime
+import json
 
 # ==================== 配置区域 ====================
 VERCEL_API_URL = "https://learn-self-eight.vercel.app/api"
@@ -30,6 +31,10 @@ if 'page' not in st.session_state:
     st.session_state.page = 1
 if 'page_size' not in st.session_state:
     st.session_state.page_size = 10
+if 'current_task_id' not in st.session_state:
+    st.session_state.current_task_id = None
+if 'auto_refresh' not in st.session_state:
+    st.session_state.auto_refresh = False
 
 # 标题
 st.title("🤖 代理技能中心")
@@ -50,80 +55,65 @@ with st.sidebar:
     st.markdown("### 🔄 同步状态")
 
     try:
-        # 同时获取状态和进度
-        status_response = requests.get(
-            f"{VERCEL_API_URL}/sync/status",
-            timeout=5
-        )
+        # 获取队列信息
+        queue_response = requests.get(f"{VERCEL_API_URL}/sync/queue", timeout=5)
         
-        progress_response = requests.get(
-            f"{VERCEL_API_URL}/sync/progress",
-            timeout=5
-        )
-
-        if status_response.status_code == 200:
-
-            status_data = status_response.json()
-            progress_data = progress_response.json() if progress_response.status_code == 200 else {}
-
-            is_syncing = status_data.get("is_syncing", False)
-            last_sync = status_data.get("last_sync_time", None)
-            max_items = status_data.get("max_items", 5000)
+        if queue_response.status_code == 200:
+            queue_data = queue_response.json()
             
-            progress = progress_data.get("progress", {}) if progress_data else {}
-
-            # 创建两列布局显示状态
-            col_status, col_count = st.columns(2)
+            is_processing = queue_data.get("is_processing", False)
+            queue_size = queue_data.get("queue_size", 0)
+            current_task = queue_data.get("current_task")
+            
+            # 显示状态
+            col_status, col_queue = st.columns(2)
             
             with col_status:
-                if is_syncing:
+                if is_processing:
                     st.warning("🟡 同步中")
+                elif queue_size > 0:
+                    st.info("🟠 队列中")
                 else:
                     st.success("🟢 空闲")
             
-            with col_count:
-                if progress:
-                    st.metric(
-                        "请求进度", 
-                        f"{progress.get('total_requests', 0)}/{progress.get('max_requests', 5000)}"
-                    )
+            with col_queue:
+                st.metric("队列长度", queue_size)
             
-            # 进度条
-            if is_syncing and progress:
-                percentage = progress.get('percentage', 0)
-                st.progress(percentage / 100)
+            # 如果正在同步，显示当前任务进度
+            if is_processing and current_task:
+                st.progress(current_task.get("progress", 0) / 100)
+                st.caption(f"📊 {current_task.get('message', '同步中...')}")
                 
-                # 显示剩余请求数
-                remaining = progress.get('remaining', 0)
-                st.caption(f"⏳ 剩余请求: {remaining}")
+                # 显示API请求进度
+                api_stats = current_task.get('api_stats', {})
+                if api_stats:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("API请求", f"{api_stats.get('total_requests', 0)}/{api_stats.get('max_requests', 5000)}")
+                    with col2:
+                        st.metric("速度", f"{api_stats.get('speed', 0)}/秒")
             
-            # 显示上次同步结果
-            if st.session_state.last_sync_result and not is_syncing:
-                result = st.session_state.last_sync_result
-                if result.get('inserted', 0) > 0 or result.get('updated', 0) > 0:
-                    st.success(
-                        f"📊 上次同步: +{result.get('inserted', 0)} 新, "
-                        f"{result.get('updated', 0)} 更新"
-                    )
-            
-            # 上次同步时间
-            if last_sync:
-
-                try:
-                    if "T" in last_sync:
-                        sync_time = datetime.strptime(
-                            last_sync[:19],
-                            "%Y-%m-%dT%H:%M:%S"
-                        )
-
-                        st.info(
-                            f"📅 上次同步: {sync_time.strftime('%Y-%m-%d %H:%M')}"
-                        )
-                    else:
+            # 显示上次同步时间
+            status_response = requests.get(f"{VERCEL_API_URL}/sync/status", timeout=5)
+            if status_response.status_code == 200:
+                status_data = status_response.json()
+                last_sync = status_data.get("last_sync_time")
+                
+                if last_sync:
+                    try:
+                        if "T" in last_sync:
+                            sync_time = datetime.strptime(last_sync[:19], "%Y-%m-%dT%H:%M:%S")
+                            st.info(f"📅 上次同步: {sync_time.strftime('%Y-%m-%d %H:%M')}")
+                    except:
                         st.info(f"📅 上次同步: {last_sync}")
-
-                except:
-                    st.info(f"📅 上次同步: {last_sync}")
+            
+            # 自动刷新选项
+            if is_processing or queue_size > 0:
+                st.checkbox("🔄 自动刷新进度", key="auto_refresh", value=True)
+                
+                if st.session_state.auto_refresh:
+                    time.sleep(2)
+                    st.rerun()
 
         else:
             st.warning("⚪ 无法获取状态")
@@ -134,64 +124,83 @@ with st.sidebar:
     st.divider()
 
     # ==================== 手动同步 ====================
-    if st.button("🔄 立即同步数据", type="primary", use_container_width=True):
-
-        with st.spinner("正在同步数据..."):
-
+    
+    # 确定按钮状态和文本
+    button_disabled = is_processing
+    button_text = "⏳ 同步进行中..." if is_processing else "🔄 立即同步数据"
+    
+    if st.button(button_text, type="primary", use_container_width=True, disabled=button_disabled):
+        with st.spinner("正在创建同步任务..."):
             try:
-
-                response = requests.post(
-                    f"{VERCEL_API_URL}/sync",
-                    timeout=30  # 增加超时时间
-                )
+                response = requests.post(f"{VERCEL_API_URL}/sync", timeout=30)
 
                 if response.status_code == 200:
-
                     result = response.json()
-
-                    if result.get("status") == "busy":
-                        st.warning("⏳ 同步正在进行中")
-
-                    elif result.get("error"):
-                        st.error(f"❌ 同步失败: {result['error']}")
-
-                    else:
-                        # 保存同步结果到 session state
-                        st.session_state.last_sync_result = result
+                    
+                    if result.get("status") == "task_created":
+                        task_id = result.get("task_id")
+                        st.session_state.current_task_id = task_id
                         
-                        # 显示同步结果
-                        inserted = result.get('inserted', 0)
-                        updated = result.get('updated', 0)
-                        total = result.get('total_fetched', 0)
-                        api_stats = result.get('api_stats', {})
+                        queue_position = result.get("queue_position")
+                        queue_size = result.get("queue_size")
                         
-                        st.success(f"✅ 同步完成！")
+                        if queue_position and queue_position > 1:
+                            st.info(f"⏳ 任务已加入队列，位置: {queue_position}/{queue_size}")
+                        else:
+                            st.success("✅ 同步任务已创建，正在执行...")
                         
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.info(f"📊 新增: {inserted} 条")
-                            st.info(f"🔄 更新: {updated} 条")
-                        with col2:
-                            if api_stats:
-                                st.info(f"📡 API请求: {api_stats.get('total_requests', 0)}")
-                                st.info(f"💾 总计: {total} 条")
+                        # 显示任务信息
+                        with st.expander("查看任务详情"):
+                            st.json({
+                                "task_id": task_id,
+                                "queue_position": queue_position,
+                                "queue_size": queue_size,
+                                "is_processing": result.get("is_processing")
+                            })
                         
-                        st.session_state.last_refresh = time.strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
-                        
-                        # 等待数据写入数据库
-                        time.sleep(3)
+                        # 等待一下然后刷新
+                        time.sleep(2)
                         st.rerun()
+                    else:
+                        st.warning(result.get("message", "未知响应"))
 
                 else:
                     st.error(f"❌ API 返回错误: {response.status_code}")
 
             except requests.exceptions.Timeout:
                 st.error("⏰ 请求超时，请稍后重试")
-                
             except Exception as e:
                 st.error(f"❌ 发生错误: {str(e)}")
+
+    # 如果有当前任务，显示任务追踪
+    if st.session_state.current_task_id and is_processing:
+        st.divider()
+        st.markdown("### 📋 当前任务")
+        
+        try:
+            task_response = requests.get(f"{VERCEL_API_URL}/sync/task/{st.session_state.current_task_id}", timeout=5)
+            if task_response.status_code == 200:
+                task_data = task_response.json()
+                
+                st.progress(task_data.get("progress", 0) / 100)
+                st.caption(task_data.get("message", ""))
+                
+                if task_data.get("is_completed"):
+                    st.success("✅ 任务完成")
+                    if task_data.get("result"):
+                        result = task_data.get("result")
+                        st.info(f"📊 新增: {result.get('inserted', 0)}, 更新: {result.get('updated', 0)}")
+                    
+                    # 清除任务ID
+                    if st.button("清除任务记录"):
+                        st.session_state.current_task_id = None
+                        st.rerun()
+                        
+                elif task_data.get("is_failed"):
+                    st.error(f"❌ 任务失败: {task_data.get('error')}")
+                    
+        except Exception as e:
+            st.error(f"获取任务状态失败: {e}")
 
     st.divider()
 
@@ -232,25 +241,45 @@ with st.sidebar:
 
     # ==================== 快捷操作 ====================
     if st.button("🔄 重置筛选", use_container_width=True):
-
         st.session_state.category = "全部"
         st.session_state.sort = "综合评分"
         st.session_state.page = 1
         st.session_state.page_size = 10
-
         st.rerun()
     
     st.divider()
+    
+    # ==================== 任务队列 ====================
+    with st.expander("📋 任务队列"):
+        try:
+            tasks_response = requests.get(f"{VERCEL_API_URL}/sync/tasks?limit=5", timeout=5)
+            if tasks_response.status_code == 200:
+                tasks_data = tasks_response.json()
+                tasks = tasks_data.get("tasks", [])
+                
+                if tasks:
+                    for task in tasks:
+                        status = task.get("status")
+                        if status == "completed":
+                            st.success(f"✅ {task.get('created_at', '')[:16]}")
+                        elif status == "running":
+                            st.warning(f"🔄 {task.get('created_at', '')[:16]} - {task.get('progress', 0)}%")
+                        elif status == "failed":
+                            st.error(f"❌ {task.get('created_at', '')[:16]}")
+                        elif status in ["queued", "waiting"]:
+                            st.info(f"⏳ {task.get('created_at', '')[:16]} (位置: {task.get('queue_position', '?')})")
+                else:
+                    st.caption("暂无任务记录")
+            else:
+                st.caption("无法获取任务列表")
+        except Exception as e:
+            st.caption("获取任务列表失败")
     
     # ==================== 调试工具 ====================
     with st.expander("🔧 调试工具"):
         if st.button("检查数据变化", use_container_width=True):
             try:
-                # 获取当前数据统计
-                debug_response = requests.get(
-                    f"{VERCEL_API_URL}/debug/sync-info",
-                    timeout=5
-                )
+                debug_response = requests.get(f"{VERCEL_API_URL}/debug/sync-info", timeout=5)
                 
                 if debug_response.status_code == 200:
                     debug_data = debug_response.json()
@@ -303,19 +332,11 @@ total_pages = 1
 # ==================== 获取技能数据 ====================
 
 try:
-
     with st.spinner("🚀 加载技能数据..."):
-
-        response = requests.get(
-            f"{VERCEL_API_URL}/skills",
-            params=params,
-            timeout=15
-        )
+        response = requests.get(f"{VERCEL_API_URL}/skills", params=params, timeout=15)
 
     if response.status_code == 200:
-
         data = response.json()
-
         total = data.get("total", 0)
         items = data.get("items", [])
 
@@ -342,45 +363,34 @@ try:
         st.divider()
 
         if not items:
-
             st.info("💡 暂无数据，请点击左侧「立即同步」按钮")
-
         else:
-
             for idx, skill in enumerate(items, 1):
-
                 with st.container():
-
                     col1, col2 = st.columns([3, 1])
 
                     with col1:
                         st.subheader(f"{idx}. {skill.get('name', 'Unknown')}")
-                        st.caption(
-                            f"🏷️ 分类: {skill.get('category', 'N/A')}"
-                        )
+                        st.caption(f"🏷️ 分类: {skill.get('category', 'N/A')}")
 
                     with col2:
                         score = skill.get("score", 0)
                         st.metric("综合评分", f"{score:.1f}")
 
-                    # 描述
                     description = skill.get("description", "")
                     if description:
                         st.write(description[:200] + ('...' if len(description) > 200 else ''))
                     else:
                         st.write("*暂无描述*")
 
-                    # GitHub链接
                     url = skill.get("url")
                     if url:
                         st.markdown(f"🔗 [GitHub仓库]({url})")
 
-                    # 作者信息
                     author = skill.get('author', 'Unknown')
                     followers = skill.get('author_followers', 0)
                     st.caption(f"👤 作者: {author} | 关注者: {followers:,}")
 
-                    # 使用5列布局展示所有指标
                     col1, col2, col3, col4, col5 = st.columns(5)
 
                     with col1:
@@ -403,7 +413,6 @@ try:
                         commits = skill.get('total_commits', 0)
                         st.markdown(f"**📝 提交次数:** {commits:,}")
 
-                    # 最后提交时间
                     last_commit = skill.get("last_commit")
                     if last_commit:
                         try:
@@ -439,7 +448,6 @@ except Exception as e:
 # ==================== 分页 ====================
 
 if total_pages > 1:
-
     col1, col2, col3, col4, col5 = st.columns([1, 2, 1, 2, 1])
 
     with col2:

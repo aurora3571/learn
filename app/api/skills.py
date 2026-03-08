@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
@@ -12,6 +12,7 @@ from app.config import settings
 import logging
 import traceback
 from datetime import datetime
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,9 @@ def list_skills(
     try:
         query = db.query(Skill)
 
-        # 分类过滤
         if category:
             query = query.filter(Skill.category == category)
 
-        # 排序逻辑
         if sort == "score":
             query = query.order_by(Skill.score.desc())
         elif sort == "stars":
@@ -52,10 +51,7 @@ def list_skills(
         elif sort == "time":
             query = query.order_by(Skill.last_commit.desc())
 
-        # 统计总数
         total = query.count()
-
-        # 分页
         items = query.offset((page - 1) * size).limit(size).all()
 
         return {
@@ -69,19 +65,115 @@ def list_skills(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/sync/status")
-def get_sync_status():
-    """获取同步状态"""
+@router.post("/sync")
+def sync_data(db: Session = Depends(get_db)):
+    """手动触发同步 - 使用任务队列"""
     try:
-        time_since = None
-        if SyncService._last_sync_time:
-            time_since = (datetime.now() - SyncService._last_sync_time).total_seconds() / 60
+        logger.info("=" * 50)
+        logger.info("MANUAL SYNC REQUESTED")
+        logger.info("=" * 50)
+
+        # 创建同步任务
+        task_id = SyncService.create_sync_task(
+            db_factory=lambda: SessionLocal(),
+            is_auto_sync=False
+        )
+
+        # 获取任务状态
+        task_status = SyncService.get_task_status(task_id)
+        
+        # 获取队列信息
+        queue_info = SyncService.get_queue_info()
 
         return {
-            "is_syncing": SyncService._is_syncing,
+            "message": "同步任务已创建",
+            "status": "task_created",
+            "task_id": task_id,
+            "queue_position": task_status.get("queue_position") if task_status else None,
+            "queue_size": queue_info.get("queue_size"),
+            "is_processing": queue_info.get("is_processing"),
+            "current_task_id": queue_info.get("current_task_id")
+        }
+
+    except Exception as e:
+        logger.error(f"Error in sync_data: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {"error": str(e), "message": "创建同步任务失败"}
+
+
+@router.get("/sync/task/{task_id}")
+def get_task_status(task_id: str):
+    """获取特定同步任务的状态"""
+    try:
+        task_status = SyncService.get_task_status(task_id)
+        
+        if not task_status:
+            return {"error": "Task not found", "task_id": task_id}
+        
+        return task_status
+        
+    except Exception as e:
+        logger.error(f"Error getting task status: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/sync/tasks")
+def list_tasks(limit: int = Query(10, ge=1, le=50)):
+    """获取最近的任务列表"""
+    try:
+        tasks = SyncService.get_all_tasks(limit=limit)
+        return {
+            "tasks": tasks,
+            "total": len(tasks)
+        }
+    except Exception as e:
+        logger.error(f"Error listing tasks: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/sync/queue")
+def get_queue_info():
+    """获取队列信息"""
+    try:
+        queue_info = SyncService.get_queue_info()
+        
+        # 获取当前运行任务的信息
+        current_task = None
+        if queue_info.get("current_task_id"):
+            current_task = SyncService.get_task_status(queue_info["current_task_id"])
+        
+        return {
+            "queue_size": queue_info.get("queue_size"),
+            "is_processing": queue_info.get("is_processing"),
+            "current_task": current_task,
+            "total_tasks": queue_info.get("total_tasks")
+        }
+    except Exception as e:
+        logger.error(f"Error getting queue info: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/sync/status")
+def get_sync_status():
+    """获取同步状态（兼容旧版）"""
+    try:
+        queue_info = SyncService.get_queue_info()
+        
+        # 获取当前运行任务的信息
+        current_task = None
+        if queue_info.get("current_task_id"):
+            current_task = SyncService.get_task_status(queue_info["current_task_id"])
+        
+        # 获取请求统计
+        stats = GithubFetcher.get_request_stats()
+        
+        return {
+            "is_syncing": queue_info.get("is_processing", False),
+            "queue_size": queue_info.get("queue_size", 0),
+            "current_task_id": queue_info.get("current_task_id"),
             "last_sync_time": SyncService._last_sync_time.isoformat() if SyncService._last_sync_time else None,
             "max_items": SyncService.MAX_ITEMS,
-            "time_since_last_sync_minutes": round(time_since, 1) if time_since else None
+            "progress": stats if queue_info.get("is_processing") else None
         }
     except Exception as e:
         logger.error(f"Error getting sync status: {e}")
@@ -90,52 +182,21 @@ def get_sync_status():
 
 @router.get("/sync/progress")
 def get_sync_progress():
-    """获取同步进度"""
+    """获取当前同步进度（兼容旧版）"""
     try:
         stats = GithubFetcher.get_request_stats()
+        queue_info = SyncService.get_queue_info()
 
         return {
-            "is_syncing": SyncService._is_syncing,
+            "is_syncing": queue_info.get("is_processing", False),
             "progress": stats,
-            "last_sync": SyncService._last_sync_time.isoformat()
-            if SyncService._last_sync_time else None
+            "last_sync": SyncService._last_sync_time.isoformat() if SyncService._last_sync_time else None,
+            "queue_size": queue_info.get("queue_size", 0)
         }
 
     except Exception as e:
         logger.error(f"Error getting sync progress: {e}")
         return {"error": str(e)}
-
-
-@router.post("/sync")
-def sync_data(db: Session = Depends(get_db)):
-    """手动触发同步"""
-    try:
-        logger.info("=" * 50)
-        logger.info("MANUAL SYNC REQUESTED")
-        logger.info("=" * 50)
-
-        # 检查是否正在同步
-        if SyncService._is_syncing:
-            logger.warning("Manual sync blocked - sync already in progress")
-            return {
-                "message": "Sync already in progress",
-                "status": "busy"
-            }
-
-        # 执行同步
-        sync_service = SyncService(db)
-        result = sync_service.sync_with_limit(is_auto_sync=False)
-
-        logger.info("=" * 50)
-        logger.info(f"MANUAL SYNC COMPLETED: {result}")
-        logger.info("=" * 50)
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Error in sync_data: {str(e)}")
-        logger.error(traceback.format_exc())
-        return {"error": str(e), "message": "Sync failed"}
 
 
 @router.get("/debug/sync-info")
@@ -154,6 +215,9 @@ def debug_sync_info(db: Session = Depends(get_db)):
         ).group_by(Skill.category).all()
 
         fetcher = GithubFetcher()
+        
+        # 获取队列信息
+        queue_info = SyncService.get_queue_info()
 
         return {
             "database": {
@@ -173,7 +237,8 @@ def debug_sync_info(db: Session = Depends(get_db)):
                 ]
             },
             "keywords": fetcher.keywords,
-            "github_token_configured": bool(settings.github_token)
+            "github_token_configured": bool(settings.github_token),
+            "sync_queue": queue_info
         }
 
     except Exception as e:
