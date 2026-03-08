@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ class SyncService:
     _is_syncing = False
     _sync_task: Optional[threading.Thread] = None
     MAX_ITEMS = 5000
-    BATCH_SIZE = 50
+    BATCH_SIZE = 100  # 增大批量大小
 
     def __init__(self, db: Session):
         self.db = db
@@ -27,7 +28,7 @@ class SyncService:
         self.processed_repos = set()
 
     def sync_with_limit(self, is_auto_sync: bool = False):
-        """同步方法"""
+        """同步方法 - 优化版"""
         try:
             with self.__class__._sync_lock:
                 if self.__class__._is_syncing:
@@ -39,30 +40,30 @@ class SyncService:
             sync_type = "AUTO" if is_auto_sync else "MANUAL"
             
             # 动态调整目标数量
-            target_items = min(500 if is_auto_sync else self.MAX_ITEMS, self.MAX_ITEMS)
+            target_items = min(1000 if is_auto_sync else self.MAX_ITEMS, self.MAX_ITEMS)
             
-            logger.info(f"🚀 Starting {sync_type} sync (目标: {target_items} 条)")
+            logger.info(f"🚀 开始 {sync_type} 同步 (目标: {target_items} 条)")
 
             # 检查 GitHub Token
             logger.info(f"🔑 GitHub Token 是否存在: {bool(settings.github_token)}")
-            logger.info(f"📋 关键词数量: {len(self.fetcher.keywords)}")
-            if self.fetcher.keywords:
-                logger.info(f"🔑 前3个关键词: {self.fetcher.keywords[:3]}")
-
+            
             # 重置请求计数
             GithubFetcher.start_session()
             
             all_data = []
             page = 1
-            max_pages = 3 if is_auto_sync else 8
+            max_pages = 5 if is_auto_sync else 10  # 增加页数
             consecutive_empty = 0
 
             keywords = self.fetcher.keywords
 
-            # 顺序处理关键词
-            while len(all_data) < target_items and page <= max_pages:
+            # 第一阶段：快速收集所有仓库
+            logger.info("📚 第一阶段：收集仓库列表...")
+            all_repos = []
+            
+            while len(all_repos) < target_items * 3 and page <= max_pages:  # 收集3倍的数据以备去重
                 if GithubFetcher.should_stop():
-                    logger.info(f"⛔ 达到请求上限，停止于 {len(all_data)} 条")
+                    logger.info(f"⛔ 达到请求上限，停止于 {len(all_repos)} 条")
                     break
 
                 logger.info(f"📄 处理第 {page} 页...")
@@ -73,37 +74,15 @@ class SyncService:
                         break
                     repos = self.fetcher.search(keyword, page, per_page=30)
                     if repos:
-                        page_repos.extend(repos[:8])  # 每个关键词取8条
-                    time.sleep(0.2)
+                        page_repos.extend(repos[:15])  # 每个关键词取15条
 
                 if page_repos:
-                    # 去重
-                    unique_repos = {}
-                    for repo in page_repos:
-                        repo_id = repo['id']
-                        if repo_id not in unique_repos:
-                            unique_repos[repo_id] = repo
-                    
-                    repos_to_fetch = list(unique_repos.values())[:20]  # 最多20条
-                    
-                    logger.info(f"📦 获取 {len(repos_to_fetch)} 个仓库详情")
-                    
-                    # 顺序获取详情
-                    details = self.fetcher.fetch_repo_details_sequential(repos_to_fetch)
-                    
-                    for detail in details:
-                        if detail and detail['name'] not in self.processed_repos:
-                            all_data.append(detail)
-                            self.processed_repos.add(detail['name'])
-                    
+                    all_repos.extend(page_repos)
                     consecutive_empty = 0
                     
                     # 显示进度
-                    elapsed = time.time() - start_time
                     stats = GithubFetcher.get_request_stats()
-                    logger.info(f"📊 进度: {len(all_data)}/{target_items} 条 | "
-                              f"请求: {stats['total_requests']}/5000 | "
-                              f"速度: {stats['speed']} 条/秒")
+                    logger.info(f"📊 收集进度: {len(all_repos)} 个仓库 | 请求: {stats['total_requests']}/5000")
                 else:
                     consecutive_empty += 1
                     logger.info(f"⚠️ 第 {page} 页无数据")
@@ -114,7 +93,45 @@ class SyncService:
                     logger.info("✅ 无更多数据")
                     break
 
-            logger.info(f"✅ 共获取 {len(all_data)} 条唯一数据")
+            logger.info(f"✅ 第一阶段完成，共收集 {len(all_repos)} 个仓库")
+
+            if not all_repos:
+                return {
+                    "inserted": 0,
+                    "updated": 0,
+                    "total": 0,
+                    "message": "未获取到数据",
+                    "elapsed_seconds": round(time.time() - start_time, 2)
+                }
+
+            # 第二阶段：去重并获取详情
+            logger.info("📦 第二阶段：获取仓库详情...")
+            
+            # 去重
+            unique_repos = {}
+            for repo in all_repos:
+                repo_id = repo['id']
+                if repo_id not in unique_repos:
+                    unique_repos[repo_id] = repo
+            
+            repos_to_fetch = list(unique_repos.values())[:target_items * 2]  # 取目标数量的2倍
+            logger.info(f"📊 去重后剩余 {len(repos_to_fetch)} 个唯一仓库")
+
+            # 批量获取详情
+            details = self.fetcher.fetch_repo_details_batch(repos_to_fetch)
+            
+            # 去重
+            for detail in details:
+                if detail and detail['name'] not in self.processed_repos:
+                    all_data.append(detail)
+                    self.processed_repos.add(detail['name'])
+                    
+                    # 达到目标数量就停止
+                    if len(all_data) >= target_items:
+                        logger.info(f"✅ 达到目标数量 {target_items} 条")
+                        break
+
+            logger.info(f"✅ 第二阶段完成，共获取 {len(all_data)} 条唯一数据")
 
             if not all_data:
                 return {
@@ -151,7 +168,7 @@ class SyncService:
             self.processed_repos.clear()
 
     def _process_and_save_data(self, all_data):
-        """处理和保存数据"""
+        """处理和保存数据 - 优化批量提交"""
         try:
             logger.info(f"处理 {len(all_data)} 条数据...")
             
@@ -162,10 +179,14 @@ class SyncService:
             updated_count = 0
             inserted_count = 0
 
-            # 分批处理
+            # 分批处理 - 使用更大的批次
             batch_size = self.BATCH_SIZE
             for i in range(0, len(scored_data), batch_size):
+                batch_start = time.time()
                 batch = scored_data[i:i + batch_size]
+                
+                batch_updated = 0
+                batch_inserted = 0
                 
                 for item in batch:
                     try:
@@ -189,10 +210,10 @@ class SyncService:
                         if existing:
                             for key, value in clean_item.items():
                                 setattr(existing, key, value)
-                            updated_count += 1
+                            batch_updated += 1
                         else:
                             self.db.add(Skill(**clean_item))
-                            inserted_count += 1
+                            batch_inserted += 1
 
                     except Exception as e:
                         logger.error(f"处理错误: {e}")
@@ -200,7 +221,10 @@ class SyncService:
                 # 提交批次
                 try:
                     self.db.commit()
-                    logger.info(f"批次提交: +{inserted_count} 新, {updated_count} 更新")
+                    batch_time = time.time() - batch_start
+                    updated_count += batch_updated
+                    inserted_count += batch_inserted
+                    logger.info(f"批次提交: +{batch_inserted} 新, {batch_updated} 更新, 耗时 {batch_time:.2f}秒")
                 except Exception as e:
                     self.db.rollback()
                     logger.error(f"提交失败: {e}")

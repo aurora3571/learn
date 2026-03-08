@@ -26,37 +26,35 @@ class GithubFetcher:
     _stop_flag = False
     _success_count = 0
     _fail_count = 0
-    _start_time = None  # 添加开始时间
+    _start_time = None
 
     def __init__(self, max_workers: int = None):
         self.headers = {
             "Authorization": f"token {settings.github_token}",
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "Agent-Skills-App/3.0",
-            "Connection": "keep-alive",
-            "Keep-Alive": "timeout=30, max=1000"
         }
 
-        self.max_workers = max_workers or getattr(settings, 'github_max_workers', 10)  # 降低默认值
-
+        # 提高并发数
+        self.max_workers = max_workers or 20  # 增加到20个线程
+        
         # 创建会话并配置连接池
         self.session = requests.Session()
         self.session.headers.update(self.headers)
         
-        # 配置重试策略
+        # 配置重试策略 - 减少重试次数以加快速度
         retry_strategy = Retry(
-            total=getattr(settings, 'max_retries', 2),
-            connect=2,
-            read=2,
-            backoff_factor=0.5,
+            total=1,  # 减少重试次数
+            connect=1,
+            read=1,
+            backoff_factor=0.2,  # 减少退避时间
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS"]
         )
         
-        # 获取连接池大小
-        max_connections = getattr(settings, 'max_connections', 50)
+        # 增加连接池大小
+        max_connections = 100  # 增加到100
         
-        # 配置连接池
         adapter = HTTPAdapter(
             pool_connections=max_connections,
             pool_maxsize=max_connections,
@@ -66,17 +64,15 @@ class GithubFetcher:
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
         
-        # 设置会话属性
         self.session.verify = False
         self.session.trust_env = False
 
         self.instance_requests = 0
-        self.request_times = []
         
-        # 使用信号量控制并发
-        self.semaphore = threading.Semaphore(5)  # 限制并发数为5
+        # 使用信号量控制并发 - 提高并发数
+        self.semaphore = threading.Semaphore(15)  # 增加到15
 
-        # 精简关键词列表
+        # 关键词列表保持不变
         self.keywords = [
             "claude-mcp",
             "agent-tools",
@@ -90,6 +86,10 @@ class GithubFetcher:
             "function calling",
             "mcp-server"
         ]
+        
+        # 缓存搜索结果，避免重复请求
+        self.search_cache = {}
+        self.cache_lock = threading.RLock()
 
     @classmethod
     def start_session(cls):
@@ -154,8 +154,8 @@ class GithubFetcher:
                 self.__class__._fail_count += 1
             current = self.__class__._total_requests
             
-            # 每50条记录进度
-            if current % 50 == 0:
+            # 每100条记录进度，减少日志输出
+            if current % 100 == 0:
                 elapsed = time.time() - self.__class__._start_time if self.__class__._start_time else 0
                 speed = current / elapsed if elapsed > 0 else 0
                 success_rate = self._get_success_rate()
@@ -165,22 +165,26 @@ class GithubFetcher:
             return current
 
     def _rate_limit_control(self):
-        """速率控制"""
-        time.sleep(settings.request_delay)
+        """动态速率控制 - 根据剩余请求数调整延迟"""
+        remaining = self.get_remaining_requests()
+        
+        # 根据剩余请求数动态调整延迟
+        if remaining < 100:
+            # 剩余很少时，减慢速度避免超限
+            time.sleep(0.5)
+        elif remaining < 500:
+            time.sleep(0.2)
+        else:
+            # 剩余充足时，几乎不延迟
+            time.sleep(0.05)  # 从0.1降到0.05
 
     def _request(self, url: str, params: Optional[Dict] = None, retry_count: int = 0):
         """优化的请求方法"""
         if self.should_stop():
-            logger.debug(f"请求停止: {url}")
             return None
 
         if not self.can_make_request():
-            logger.debug(f"无法发起请求: {url}")
             return None
-
-        max_retries = getattr(settings, 'max_retries', 2)
-        retry_delay = 1
-        timeout = getattr(settings, 'request_timeout', 15)
 
         # 使用信号量控制并发
         with self.semaphore:
@@ -188,15 +192,18 @@ class GithubFetcher:
                 self._rate_limit_control()
                 current_count = self._increment_request_count()
 
-                logger.info(f"📡 发起请求 #{current_count}: {url[:50]}...")
+                # 减少日志输出 - 每50个请求才记录
+                if current_count % 50 == 0:
+                    logger.info(f"📡 请求 #{current_count}: {url[:50]}...")
 
                 response = self.session.get(
                     url,
                     params=params,
-                    timeout=timeout,
+                    timeout=10,  # 减少超时时间
                     stream=False
                 )
 
+                # 处理限流
                 if response.status_code in (403, 429):
                     reset_time = int(
                         response.headers.get(
@@ -216,25 +223,22 @@ class GithubFetcher:
                 return response
 
             except requests.exceptions.SSLError as e:
-                logger.warning(f"🔒 SSL错误 (尝试 {retry_count + 1}/{max_retries}): {e}")
-                if retry_count < max_retries:
-                    time.sleep(retry_delay * (retry_count + 1))
+                if retry_count < 1:  # 最多重试1次
+                    time.sleep(0.5)
                     return self._request(url, params, retry_count + 1)
                 self._increment_request_count(success=False)
                 return None
 
             except requests.exceptions.ConnectionError as e:
-                logger.warning(f"🔌 连接错误 (尝试 {retry_count + 1}/{max_retries}): {e}")
-                if retry_count < max_retries:
-                    time.sleep(retry_delay * (retry_count + 1))
+                if retry_count < 1:
+                    time.sleep(0.5)
                     return self._request(url, params, retry_count + 1)
                 self._increment_request_count(success=False)
                 return None
 
             except requests.exceptions.Timeout as e:
-                logger.warning(f"⏰ 超时错误 (尝试 {retry_count + 1}/{max_retries}): {e}")
-                if retry_count < max_retries:
-                    time.sleep(retry_delay)
+                if retry_count < 1:
+                    time.sleep(0.5)
                     return self._request(url, params, retry_count + 1)
                 self._increment_request_count(success=False)
                 return None
@@ -253,9 +257,18 @@ class GithubFetcher:
         return (cls._success_count / total) * 100
 
     def search(self, keyword: str, page: int = 1, per_page: int = 30):
-        """搜索方法"""
+        """搜索方法 - 带缓存"""
         if self.should_stop():
             return []
+            
+        # 缓存键
+        cache_key = f"{keyword}_{page}"
+        
+        # 检查缓存
+        with self.cache_lock:
+            if cache_key in self.search_cache:
+                logger.info(f"🔍 使用缓存: {keyword} 第{page}页")
+                return self.search_cache[cache_key]
 
         url = f"{self.BASE_URL}/search/repositories"
         params = {
@@ -273,6 +286,11 @@ class GithubFetcher:
             if response:
                 data = response.json()
                 items = data.get("items", [])
+                
+                # 存入缓存
+                with self.cache_lock:
+                    self.search_cache[cache_key] = items
+                
                 logger.info(f"✅ 找到 {len(items)} 个仓库")
                 return items
             else:
@@ -283,19 +301,37 @@ class GithubFetcher:
 
         return []
 
-    def fetch_repo_details_sequential(self, repos):
-        """顺序获取仓库详情"""
-        results = []
-        for i, repo in enumerate(repos[:20]):
-            if self.should_stop():
-                break
+    def fetch_repo_details_batch(self, repos):
+        """批量获取仓库详情 - 使用线程池"""
+        if not repos:
+            return []
             
-            logger.info(f"📦 获取仓库 {i+1}/{min(20, len(repos))}: {repo.get('name')}")
-            detail = self._fetch_single_repo(repo)
-            if detail:
-                results.append(detail)
-            time.sleep(0.2)
-
+        results = []
+        
+        # 限制数量
+        repos_to_fetch = repos[:30]  # 增加到30
+        
+        logger.info(f"📦 开始批量获取 {len(repos_to_fetch)} 个仓库详情")
+        
+        # 使用线程池并发获取
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # 提交所有任务
+            future_to_repo = {
+                executor.submit(self._fetch_single_repo, repo): repo 
+                for repo in repos_to_fetch
+            }
+            
+            # 收集结果
+            for future in as_completed(future_to_repo):
+                repo = future_to_repo[future]
+                try:
+                    result = future.result(timeout=10)
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    logger.error(f"获取仓库详情失败 {repo.get('name')}: {e}")
+        
+        logger.info(f"✅ 批量获取完成，成功: {len(results)}/{len(repos_to_fetch)}")
         return results
 
     def _fetch_single_repo(self, repo):
@@ -311,7 +347,7 @@ class GithubFetcher:
 
             repo_detail = repo_response.json()
 
-            # 获取最后提交时间
+            # 获取最后提交时间 - 使用单次请求
             last_commit = datetime.utcnow()
             try:
                 commits_url = f"{self.BASE_URL}/repos/{owner}/{repo_name}/commits"
@@ -345,7 +381,7 @@ class GithubFetcher:
                 "forks": repo_detail.get("forks_count", 0),
                 "open_issues": repo_detail.get("open_issues_count", 0),
                 "closed_issues": 0,
-                "total_commits": 1,
+                "total_commits": repo_detail.get("forks_count", 0),  # 使用forks作为近似值
                 "last_commit": last_commit,
                 "author": owner,
                 "author_followers": 0
